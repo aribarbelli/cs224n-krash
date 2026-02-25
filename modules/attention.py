@@ -2,6 +2,7 @@ import torch
 
 from einops import rearrange
 from torch import nn
+import math
 
 
 class CausalSelfAttention(nn.Module):
@@ -33,8 +34,37 @@ class CausalSelfAttention(nn.Module):
 
   def attention(self, key, query, value, attention_mask):
 
-    ### YOUR CODE HERE
-    raise NotImplementedError
+    #IMPLEMENT THIS FUNCTION!!!!!
+
+    print("k shape is:", key.shape)
+    print("q shape is:", query.shape)
+    print("v shape is:", value.shape)
+    # b = batch size
+    # h = num_attention_heads
+    # t = sequence length
+    # d_head = attention_head_size = dimensions / num_heads
+
+    # (b, h, t, d_h) = (batch_size, num_attention_heads, sequence length, dimnesions/heads)
+    b, h, t, d_h = key.shape
+    print(key.shape)
+    print(attention_mask.shape)
+
+    # softmax((Q@K_t) / sqrt(dh)) @ v
+    key_transposed = key.transpose(-1, -2)
+    scores = query @ key_transposed
+    scores = scores / math.sqrt(d_h)
+
+    # causal masking
+    mask = attention_mask[:, :, :t, :t] # slicing to make sure that the shape is (1, 1, context_len, context_len)
+    scores = scores.masked_fill(mask == 0, float("-inf")) # need to use large negative number for softmax
+
+    out = torch.nn.functional.softmax(scores, dim=-1) @ value
+    # out has shape (b, h, t, d/h)
+    out = out.transpose(1, 2) # (b, t, h, d/h)
+    hidden_size = h * d_h # hidden size 
+    out = out.reshape(b, t, hidden_size) # (b, t, d)
+
+    return out
 
 
   def forward(self, hidden_states, attention_mask):

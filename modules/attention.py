@@ -54,11 +54,16 @@ class CausalSelfAttention(nn.Module):
     scores = query @ key_transposed
     scores = scores / math.sqrt(d_h)
 
-    # causal masking
-    mask = attention_mask[:, :, :t, :t] # slicing to make sure that the shape is (1, 1, context_len, context_len)
-    scores = scores.masked_fill(mask == 0, float("-inf")) # need to use large negative number for softmax
+    print("mask sample:", attention_mask[0,0,0,:])
+    # causal mask: block attending to future tokens
+    causal = torch.tril(torch.ones(t, t, device=scores.device)).bool()   # [t, t]
+    causal = causal.view(1, 1, t, t)                                     # [1, 1, t, t]
+    scores = scores.masked_fill(~causal, float("-inf"))
+    # padding mask (additive): attention_mask is [b, 1, 1, t] with 0 for real tokens and -10000 for pads
+    scores = scores + attention_mask
 
-    out = torch.nn.functional.softmax(scores, dim=-1) @ value
+    out = torch.nn.functional.softmax(scores, dim=-1) 
+    out = self.dropout(out) @ value 
     # out has shape (b, h, t, d/h)
     out = out.transpose(1, 2) # (b, t, h, d/h)
     hidden_size = h * d_h # hidden size 

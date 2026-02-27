@@ -2,6 +2,7 @@ import torch
 
 from einops import rearrange
 from torch import nn
+import math
 
 
 class CausalSelfAttention(nn.Module):
@@ -32,9 +33,29 @@ class CausalSelfAttention(nn.Module):
     return proj
 
   def attention(self, key, query, value, attention_mask):
+    # (b, h, t, d_h) = (batch_size, num_attention_heads, sequence length, dimnesions/heads)
+    b, h, t, d_h = key.shape
 
-    ### YOUR CODE HERE
-    raise NotImplementedError
+    # softmax((Q@K_t) / sqrt(dh)) @ v
+    key_transposed = key.transpose(-1, -2)
+    scores = query @ key_transposed
+    scores = scores / math.sqrt(d_h)
+
+    # causal mask: block attending to future tokens
+    causal = torch.tril(torch.ones(t, t, device=scores.device)).bool()   # [t, t]
+    causal = causal.view(1, 1, t, t)                                     # [1, 1, t, t]
+    scores = scores.masked_fill(~causal, float("-inf"))
+    # padding mask (additive): attention_mask is [b, 1, 1, t] with 0 for real tokens and -10000 for pads
+    scores = scores + attention_mask
+
+    out = torch.nn.functional.softmax(scores, dim=-1) 
+    out = self.dropout(out) @ value 
+    # out has shape (b, h, t, d/h)
+    out = out.transpose(1, 2) # (b, t, h, d/h)
+    hidden_size = h * d_h # hidden size 
+    out = out.reshape(b, t, hidden_size) # (b, t, d)
+
+    return out
 
 
   def forward(self, hidden_states, attention_mask):

@@ -34,6 +34,10 @@ from optimizer import AdamW
 
 TQDM_DISABLE = False
 
+NO_TOKEN_ID = 3919
+YES_TOKEN_ID = 8505
+FULL_LOGITS_SIZE = 8506  
+
 # Fix the random seed.
 def seed_everything(seed=11711):
   random.seed(seed)
@@ -69,10 +73,19 @@ class ParaphraseGPT(nn.Module):
     token "yes" (byte pair encoding index of 8505) for examples that are paraphrases or "no" (byte pair encoding index
      of 3919) for examples that are not paraphrases.
     """
+    gpt_output = self.gpt(input_ids, attention_mask)
+    last_token_hidden = gpt_output['last_token']  #L [batch_size, d]
+    logits = self.paraphrase_detection_head(last_token_hidden)  # [batch_size, 2]
+    full_logits = torch.full(
+      (logits.shape[0], FULL_LOGITS_SIZE),
+      -100.0,
+      device=logits.device,
+      dtype=logits.dtype,
+    )
+    full_logits[:, NO_TOKEN_ID] = logits[:, 0]   # no
+    full_logits[:, YES_TOKEN_ID] = logits[:, 1]  # yes
+    return full_logits
 
-    'Takes a batch of sentences and produces embeddings for them.'
-    ### YOUR CODE HERE
-    raise NotImplementedError
 
 
 
@@ -112,6 +125,8 @@ def train(args):
   lr = args.lr
   optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.)
   best_dev_acc = 0
+  patience_counter = 0
+  patience = args.patience
 
   # Run for the specified number of epochs.
   for epoch in range(args.epochs):
@@ -140,18 +155,26 @@ def train(args):
 
     dev_acc, dev_f1, *_ = model_eval_paraphrase(para_dev_dataloader, model, device)
 
-    if dev_acc > best_dev_acc:
+    if dev_acc >= best_dev_acc:
       best_dev_acc = dev_acc
+      patience_counter = 0
       save_model(model, optimizer, args, args.filepath)
+      print(f"  New best dev acc. Saved model.")
+    else:
+      patience_counter += 1
+      print(f"  Dev acc did not improve. Patience: {patience_counter}/{patience}")
 
     print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, dev acc :: {dev_acc :.3f}")
+    if patience_counter >= patience:
+      print(f"Early stopping triggered at epoch {epoch}.")
+      break
 
 
 @torch.no_grad()
 def test(args):
   """Evaluate your model on the dev and test datasets; save the predictions to disk."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-  saved = torch.load(args.filepath)
+  saved = torch.load(args.filepath, weights_only=False)
 
   model = ParaphraseGPT(saved['args'])
   model.load_state_dict(saved['model'])
@@ -177,7 +200,9 @@ def test(args):
   with open(args.para_dev_out, "w+") as f:
     f.write(f"id \t Predicted_Is_Paraphrase \n")
     for p, s in zip(dev_para_sent_ids, dev_para_y_pred):
-      f.write(f"{p}, {s} \n")
+      # Write token IDs (3919/8505) for submission format, not class labels 0/1
+      token_id = NO_TOKEN_ID if s == 0 else YES_TOKEN_ID
+      f.write(f"{p}, {token_id} \n")
 
   with open(args.para_test_out, "w+") as f:
     f.write(f"id \t Predicted_Is_Paraphrase \n")
@@ -200,6 +225,7 @@ def get_args():
 
   parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=8)
   parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
+  parser.add_argument("--patience", type=int, help="Early stopping patience (epochs).", default=3)
   parser.add_argument("--model_size", type=str,
                       help="The model size as specified on hugging face. DO NOT use the xl model.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')

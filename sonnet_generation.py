@@ -8,6 +8,7 @@ trains your SonnetGPT model and writes the required submission files.
 '''
 
 import argparse
+import os
 import random
 import torch
 
@@ -28,6 +29,15 @@ from models.gpt2 import GPT2Model
 from optimizer import AdamW
 
 TQDM_DISABLE = False
+
+
+def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps):
+  """Linear warmup then linear decay (no warmup after warmup_steps)."""
+  def lr_lambda(step):
+    if step < num_warmup_steps:
+      return float(step) / float(max(1, num_warmup_steps))
+    return max(0.0, float(num_training_steps - step) / float(max(1, num_training_steps - num_warmup_steps)))
+  return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 # Fix the random seed.
@@ -53,6 +63,10 @@ class SonnetGPT(nn.Module):
     # By default, fine-tune the full model. TODO: this is maybe not idea.
     for param in self.gpt.parameters():
       param.requires_grad = True
+    # params = list(self.gpt.parameters())
+    # freeze_until = int(len(params) * 0.8)
+    # for i, param in enumerate(self.gpt.parameters()):
+    #   param.requires_grad = (i >= freeze_until)
 
   def forward(self, input_ids, attention_mask):
     """
@@ -60,8 +74,9 @@ class SonnetGPT(nn.Module):
     not just the last token! This will allow our model to learn the natural language distribution that composes sonnets,
     not just the distribution over next tokens for the last token!
     """
-    ### YOUR CODE HERE
-    raise NotImplementedError
+    gpt_output = self.gpt(input_ids, attention_mask)
+    logits = self.gpt.hidden_state_to_token(gpt_output['last_hidden_state'])  # [batch_size, seq_len, vocab_size]
+    return logits
 
 
   def get_device(self):
@@ -69,44 +84,62 @@ class SonnetGPT(nn.Module):
       return param.device
 
   @torch.no_grad()
-  def generate(self, encoding, temperature=0.7, top_p=0.9, max_length=128):
+  def generate(self, encoding, temperature=0.8, top_p=0.92, top_k=40, repetition_penalty=1.15, max_length=256, min_new_tokens=0):
     """
-    Generates an original sonnet using top-p sampling and softmax temperature.
-
-    TODO: this is probably not ideal. You can look at hugging face's model.generate(...) function for inspiration.
-    In particular, generating multiple sequences and choosing the best with beam search is one avenue. Top_k is another;
-    there are many.
+    Generates an original sonnet using temperature, repetition penalty (on generated tokens only),
+    top-k, and top-p (nucleus) sampling. Repetition penalty is applied only to the continuation
+    so the model can reuse prompt vocabulary; EOS is blocked until min_new_tokens are generated.
     """
     token_ids = encoding.to(self.get_device())
     attention_mask = torch.ones(token_ids.shape, dtype=torch.int64).to(self.get_device())
+    eos_id = self.tokenizer.eos_token_id
+    prompt_length = token_ids.shape[1]
+    num_generated = 0
 
-
-    for _ in range(max_length):
-      # Forward pass to get logits
+    for _ in range(max_length - prompt_length):
       logits_sequence = self.forward(token_ids, attention_mask)
-      logits_last_token = logits_sequence[:, -1, :] / temperature  # Apply temperature scaling
+      logits_last_token = logits_sequence[:, -1, :].clone().float()
 
-      # Convert logits to probabilities
-      probs = torch.nn.functional.softmax(logits_last_token, dim=-1)
+      # Repetition penalty only on *generated* tokens (not the prompt), so we don't suppress
+      # normal vocabulary that appeared in the prompt and cause early EOS.
+      if repetition_penalty != 1.0 and token_ids.shape[1] > prompt_length:
+        for i in range(prompt_length, token_ids.shape[1]):
+          token = token_ids[0, i].item()
+          if logits_last_token[0, token] > 0:
+            logits_last_token[0, token] /= repetition_penalty
+          else:
+            logits_last_token[0, token] *= repetition_penalty
+
+      # Block EOS until we've generated at least min_new_tokens (full sonnet ~100+ tokens)
+      if num_generated < min_new_tokens:
+        logits_last_token[0, eos_id] = -float('inf')
+
+      # Temperature scaling
+      logits_last_token = logits_last_token / temperature
+
+      # Top-k: zero out logits below the k-th largest
+      if top_k > 0:
+        k = min(top_k, logits_last_token.size(-1))
+        indices_to_remove = logits_last_token < torch.topk(logits_last_token, k)[0][..., -1, None]
+        logits_last_token[indices_to_remove] = -float('inf')
+
+      probs = F.softmax(logits_last_token, dim=-1)
 
       # Top-p (nucleus) sampling
       sorted_probs, sorted_indices = torch.sort(probs, descending=True)
       cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
       top_p_mask = cumulative_probs <= top_p
-      top_p_mask[..., 1:] = top_p_mask[..., :-1].clone()  # Shift mask right for proper thresholding
-      top_p_mask[..., 0] = True  # Always include the highest probability token
-      filtered_probs = sorted_probs * top_p_mask  # Zero out unlikely tokens
-      filtered_probs /= filtered_probs.sum(dim=-1, keepdim=True)  # Normalize probabilities
-
-      # Sample from filtered distribution
+      top_p_mask[..., 1:] = top_p_mask[..., :-1].clone()
+      top_p_mask[..., 0] = True
+      filtered_probs = sorted_probs * top_p_mask.float()
+      filtered_probs = filtered_probs / filtered_probs.sum(dim=-1, keepdim=True).clamp(min=1e-10)
       sampled_index = torch.multinomial(filtered_probs, 1)
       sampled_token = sorted_indices.gather(dim=-1, index=sampled_index)
 
-      # Stop if end-of-sequence token is reached
-      if sampled_token.item() == self.tokenizer.eos_token_id:
+      num_generated += 1
+      if sampled_token.item() == eos_id:
         break
 
-      # Append sampled token
       token_ids = torch.cat([token_ids, sampled_token], dim=1)
       attention_mask = torch.cat(
         [attention_mask, torch.ones((1, 1), dtype=torch.int64).to(self.get_device())], dim=1
@@ -146,7 +179,15 @@ def train(args):
   model = model.to(device)
 
   lr = args.lr
-  optimizer = AdamW(model.parameters(), lr=lr)
+  optimizer = AdamW(model.parameters(), lr=lr, weight_decay=args.weight_decay)
+
+  num_training_steps = len(sonnet_dataloader) * args.epochs
+  num_warmup_steps = min(args.warmup_ratio * num_training_steps, len(sonnet_dataloader))
+  scheduler = get_linear_schedule_with_warmup(optimizer, int(num_warmup_steps), num_training_steps)
+
+  best_loss = float('inf')
+  patience = args.patience
+  patience_counter = 0
 
   # Run for the specified number of epochs.
   for epoch in range(args.epochs):
@@ -155,58 +196,96 @@ def train(args):
     num_batches = 0
 
     for batch in tqdm(sonnet_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
-      # Get the input and move it to the gpu (I do not recommend training this model on CPU).
       b_ids, b_mask = batch['token_ids'], batch['attention_mask']
       b_ids = b_ids.to(device)
       b_mask = b_mask.to(device)
 
-      # Compute the loss, gradients, and update the model's parameters.
       optimizer.zero_grad()
       logits = model(b_ids, b_mask)
-      logits = rearrange(logits[:, :-1].contiguous(), 'b t d -> (b t) d')  # Ignore the last prediction in the sequence.
-      labels = b_ids[:, 1:].contiguous().flatten()  # Ignore the first token to compose the labels.
-      loss = F.cross_entropy(logits, labels, reduction='mean')
+      logits = rearrange(logits[:, :-1].contiguous(), 'b t d -> (b t) d')
+      labels = b_ids[:, 1:].contiguous().flatten()
+      loss = F.cross_entropy(logits, labels, reduction='mean', label_smoothing=args.label_smoothing)
       loss.backward()
+      if args.max_grad_norm > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
       optimizer.step()
+      scheduler.step()
 
       train_loss += loss.item()
       num_batches += 1
 
     train_loss = train_loss / num_batches
     print(f"Epoch {epoch}: train loss :: {train_loss :.3f}.")
+
+    # Early stopping: save best model when loss improves
+    if train_loss < best_loss:
+      best_loss = train_loss
+      patience_counter = 0
+      save_model(model, optimizer, args, f'best_{args.filepath}')
+      print(f"  New best loss. Saved best model.")
+    else:
+      patience_counter += 1
+      print(f"  Loss did not improve. Patience: {patience_counter}/{patience}")
+
+    save_model(model, optimizer, args, f'{epoch}_{args.filepath}')
+
+    # Show a few generated sonnets during training
     print('Generating several output sonnets...')
     model.eval()
-    for batch in held_out_sonnet_dataset:
+    for i, batch in enumerate(held_out_sonnet_dataset):
+      if i >= 2:
+        break
       encoding = model.tokenizer(batch[1], return_tensors='pt', padding=True, truncation=True).to(device)
-      output = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)
+      output = model.generate(
+        encoding['input_ids'],
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        repetition_penalty=args.repetition_penalty,
+        max_length=args.gen_max_length,
+        min_new_tokens=args.min_new_tokens,
+      )
       print(f'{batch[1]}{output[1]}\n\n')
 
-    # TODO: consider a stopping condition to prevent overfitting on the small dataset of sonnets.
-    save_model(model, optimizer, args, f'{epoch}_{args.filepath}')
+    if patience_counter >= patience:
+      print(f"Early stopping triggered at epoch {epoch}.")
+      break
 
 
 @torch.no_grad()
 def generate_submission_sonnets(args):
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-  saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
+  # Load best checkpoint if available, else last epoch
+  checkpoint_path = f'best_{args.filepath}'
+  if not os.path.isfile(checkpoint_path):
+    checkpoint_path = f'{args.epochs - 1}_{args.filepath}'
+  if not os.path.isfile(checkpoint_path):
+    raise FileNotFoundError(f"No checkpoint found: tried best_{args.filepath} and {args.epochs - 1}_{args.filepath}")
+  saved = torch.load(checkpoint_path, weights_only=False)
 
   model = SonnetGPT(saved['args'])
   model.load_state_dict(saved['model'])
   model = model.to(device)
   model.eval()
 
-  # Create the held-out dataset: these only have the first 3 lines. Your job is to fill in the rest!
   held_out_sonnet_dataset = SonnetsDataset(args.held_out_sonnet_path)
 
   generated_sonnets = []
   for batch in held_out_sonnet_dataset:
     sonnet_id = batch[0]
     encoding = model.tokenizer(batch[1], return_tensors='pt', padding=False, truncation=True).to(device)
-    output = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)[0][0]
-    decoded_output = model.tokenizer.decode(output)
+    token_ids, _ = model.generate(
+      encoding['input_ids'],
+      temperature=args.temperature,
+      top_p=args.top_p,
+      top_k=args.top_k,
+      repetition_penalty=args.repetition_penalty,
+      max_length=args.gen_max_length,
+      min_new_tokens=args.min_new_tokens,
+    )
+    decoded_output = model.tokenizer.decode(token_ids[0])
     full_sonnet = f'{decoded_output}\n\n'
     generated_sonnets.append((sonnet_id, full_sonnet))
-
     print(f'{decoded_output}\n\n')
 
   with open(args.sonnet_out, "w+") as f:
@@ -228,12 +307,20 @@ def get_args():
   parser.add_argument("--use_gpu", action='store_true')
 
   # Generation parameters.
-  parser.add_argument("--temperature", type=float, help="softmax temperature.", default=1.2)
-  parser.add_argument("--top_p", type=float, help="Cumulative probability distribution for nucleus sampling.",
-                      default=0.9)
+  parser.add_argument("--temperature", type=float, help="softmax temperature.", default=0.9)
+  parser.add_argument("--top_p", type=float, help="Cumulative probability for nucleus sampling.", default=0.92)
+  parser.add_argument("--top_k", type=int, help="Top-k filtering (0 = disabled).", default=40)
+  parser.add_argument("--repetition_penalty", type=float, help="Penalty for repeating tokens.", default=1.15)
+  parser.add_argument("--gen_max_length", type=int, help="Max tokens to generate.", default=256)
+  parser.add_argument("--min_new_tokens", type=int, help="Min tokens before EOS allowed (avoids early stop).", default=90)
 
   parser.add_argument("--batch_size", help='The training batch size.', type=int, default=8)
-  parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
+  parser.add_argument("--lr", type=float, help="learning rate", default=5e-5)
+  parser.add_argument("--weight_decay", type=float, default=0.01)
+  parser.add_argument("--warmup_ratio", type=float, help="Fraction of steps for LR warmup.", default=0.1)
+  parser.add_argument("--max_grad_norm", type=float, help="Gradient clipping (0 = off).", default=1.0)
+  parser.add_argument("--label_smoothing", type=float, default=0.1)
+  parser.add_argument("--patience", type=int, help="Early stopping patience (epochs).", default=3)
   parser.add_argument("--model_size", type=str, help="The model size as specified on hugging face.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'], default='gpt2')
 

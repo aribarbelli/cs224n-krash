@@ -18,6 +18,21 @@ from datasets import (
 
 TQDM_DISABLE = False
 
+YES_TOKEN_ID = 8505
+NO_TOKEN_ID = 3919
+
+
+def _paraphrase_preds_to_classes(y_true, preds):
+  """Convert paraphrase predictions and gold to 0/1 for accuracy/F1."""
+  y_true = np.asarray(y_true)
+  preds = np.asarray(preds)
+  preds_class = (preds == YES_TOKEN_ID).astype(int)
+  if np.all(np.isin(y_true, [0, 1])):
+    y_true_class = y_true
+  else:
+    y_true_class = (y_true == YES_TOKEN_ID).astype(int)
+  return y_true_class, preds_class
+
 
 @torch.no_grad()
 def model_eval_paraphrase(dataloader, model, device):
@@ -37,10 +52,11 @@ def model_eval_paraphrase(dataloader, model, device):
     y_pred.extend(preds)
     sent_ids.extend(b_sent_ids)
 
-  f1 = f1_score(y_true, y_pred, average='macro')
-  acc = accuracy_score(y_true, y_pred)
+  y_true_class, y_pred_class = _paraphrase_preds_to_classes(y_true, y_pred)
+  f1 = f1_score(y_true_class, y_pred_class, average='macro')
+  acc = accuracy_score(y_true_class, y_pred_class)
 
-  return acc, f1, y_pred, y_true, sent_ids
+  return acc, f1, y_pred_class, y_true_class, sent_ids
 
 
 @torch.no_grad()

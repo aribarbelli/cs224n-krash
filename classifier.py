@@ -43,15 +43,32 @@ class GPT2SentimentClassifier(torch.nn.Module):
   def __init__(self, config):
     super(GPT2SentimentClassifier, self).__init__()
     self.num_labels = config.num_labels
-    self.gpt = GPT2Model.from_pretrained()
+    # self.gpt = GPT2Model.from_pretrained()
+    self.gpt = GPT2Model.from_pretrained(use_lora=(config.fine_tune_mode == "lora"))
 
     # Pretrain mode does not require updating GPT paramters.
-    assert config.fine_tune_mode in ["last-linear-layer", "full-model"]
-    for param in self.gpt.parameters():
-      if config.fine_tune_mode == 'last-linear-layer':
-        param.requires_grad = False
-      elif config.fine_tune_mode == 'full-model':
-        param.requires_grad = True
+    # assert config.fine_tune_mode in ["last-linear-layer", "full-model"]
+    # for param in self.gpt.parameters():
+    #   if config.fine_tune_mode == 'last-linear-layer':
+    #     param.requires_grad = False
+    #   elif config.fine_tune_mode == 'full-model':
+    #     param.requires_grad = True
+    assert config.fine_tune_mode in ["last-linear-layer", "full-model", "lora"]
+
+    if config.fine_tune_mode == "last-linear-layer":
+        for param in self.gpt.parameters():
+            param.requires_grad = False
+
+    elif config.fine_tune_mode == "full-model":
+        for param in self.gpt.parameters():
+            param.requires_grad = True
+
+    elif config.fine_tune_mode == "lora":
+        for param in self.gpt.parameters():
+            param.requires_grad = False
+        for name, param in self.gpt.named_parameters():
+            if "lora" in name:
+                param.requires_grad = True
 
     ### TODO: Create any instance variables you need to classify the sentiment of BERT embeddings.
     # Task head: dropout + linear classifier
@@ -67,10 +84,10 @@ class GPT2SentimentClassifier(torch.nn.Module):
     ###       the training loop currently uses F.cross_entropy as the loss function.
     ### YOUR CODE HERE
     outputs = self.gpt(input_ids=input_ids, attention_mask=attention_mask)
-    last_token = outputs["last_token"]          # [bs, hidden_size]
+    last_token = outputs["last_token"]     
 
     last_token = self.dropout(last_token)
-    logits = self.classifier(last_token)        # [bs, num_labels]
+    logits = self.classifier(last_token)  
     return logits
 
 
@@ -148,6 +165,16 @@ class SentimentTestDataset(Dataset):
     }
 
     return batched_data
+  
+# EXTENSION HELPER!
+def count_parameters(model):
+  total = sum(p.numel() for p in model.parameters())
+  trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+  print("\nParameter count:")
+  print(f"Total parameters: {total:,}")
+  print(f"Trainable parameters: {trainable:,}")
+  print(f"Percent trainable: {100 * trainable / total:.4f}%\n")
 
 
 # Load the data: a list of (sentence, label).
@@ -272,6 +299,9 @@ def train(args):
   model = GPT2SentimentClassifier(config)
   model = model.to(device)
 
+  #extension: lora
+  count_parameters(model)
+
   lr = args.lr
   optimizer = AdamW(model.parameters(), lr=lr)
   best_dev_acc = 0
@@ -353,9 +383,10 @@ def get_args():
   parser = argparse.ArgumentParser()
   parser.add_argument("--seed", type=int, default=11711)
   parser.add_argument("--epochs", type=int, default=10)
+  # lora extension: add lora mode!
   parser.add_argument("--fine-tune-mode", type=str,
                       help='last-linear-layer: the GPT parameters are frozen and the task specific head parameters are updated; full-model: GPT parameters are updated as well',
-                      choices=('last-linear-layer', 'full-model'), default="last-linear-layer")
+                      choices=('last-linear-layer', 'full-model', 'lora'), default="last-linear-layer")
   parser.add_argument("--use_gpu", action='store_true')
 
   parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=8)

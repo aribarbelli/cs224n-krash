@@ -43,17 +43,22 @@ class GPT2Model(GPTPreTrainedModel):
 
     self.init_weights()
 
+    # lora extension:
+    for layer in self.gpt_layers:
+      nn.init.zeros_(layer.self_attention.query_lora_B.weight)
+      nn.init.zeros_(layer.self_attention.value_lora_B.weight)
+
   def embed(self, input_ids):
     input_shape = input_ids.size()
     seq_length = input_shape[1]
 
     inputs_embeds = None
     # Token embeddings
-    inputs_embeds = self.word_embedding(input_ids)  # [bs, seq_len, hidden_size]
+    inputs_embeds = self.word_embedding(input_ids)  
 
     # Position ids + position embeddings
-    pos_ids = self.position_ids[:, :seq_length]     # [1, seq_len]
-    pos_embeds = self.pos_embedding(pos_ids)        # [1, seq_len, hidden_size]
+    pos_ids = self.position_ids[:, :seq_length]   
+    pos_embeds = self.pos_embedding(pos_ids)  
 
     # Combine + dropout
     hidden_states = inputs_embeds + pos_embeds
@@ -121,10 +126,10 @@ class GPT2Model(GPTPreTrainedModel):
 
 
   @classmethod
-  def from_pretrained(cls, model='gpt2', d=768, l=12, num_heads=12):
+  def from_pretrained(cls, model='gpt2', d=768, l=12, num_heads=12, use_lora=False):
     gpt_model = OpenAIGPT2Model.from_pretrained(model).eval()
     our_model = GPT2Model(GPT2Config(hidden_size=d, num_hidden_layers=l,num_attention_heads=num_heads,
-                                     intermediate_size=d*3)).eval()
+                                     intermediate_size=d*3, use_lora=use_lora)).eval()
 
     # Load word and positional embeddings.
     our_model.word_embedding.load_state_dict(gpt_model.wte.state_dict())

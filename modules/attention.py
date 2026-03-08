@@ -13,6 +13,19 @@ class CausalSelfAttention(nn.Module):
     self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
     self.all_head_size = self.num_attention_heads * self.attention_head_size
 
+    # LORA EXTENSION
+    self.use_lora = config.use_lora
+    self.lora_r = 8 # subject to change
+    self.lora_alpha = 16 # subject to change
+    # A should be random, as per LoRA paper. seems like default is random already
+    self.query_lora_A = nn.Linear(config.hidden_size, self.lora_r, bias=False)
+    self.value_lora_A = nn.Linear(config.hidden_size, self.lora_r, bias=False)
+    # B should be initialized to 0, BA = 0
+    self.query_lora_B = nn.Linear(self.lora_r, self.all_head_size, bias=False)
+    nn.init.zeros_(self.query_lora_B.weight)
+    self.value_lora_B = nn.Linear(self.lora_r, self.all_head_size, bias=False)
+    nn.init.zeros_(self.value_lora_B.weight)
+
     # Initialize the linear transformation layers for key, value, query.
     self.query = nn.Linear(config.hidden_size, self.all_head_size)
     self.key = nn.Linear(config.hidden_size, self.all_head_size)
@@ -25,6 +38,19 @@ class CausalSelfAttention(nn.Module):
   def transform(self, x, linear_layer):
     # The corresponding linear_layer of k, v, q are used to project the hidden_state (x).
     proj = linear_layer(x)
+    # Next, we need to produce multiple heads for the proj. This is done by spliting the
+    # hidden state to self.num_attention_heads, each of size self.attention_head_size.
+    proj = rearrange(proj, 'b t (h d) -> b t h d', h=self.num_attention_heads)
+    # By proper transpose, we have proj of size [bs, num_attention_heads, seq_len, attention_head_size].
+    proj = rearrange(proj, 'b t h d -> b h t d')
+    return proj
+  
+  def transform_lora(self, x, linear_layer, A_layer, B_layer):
+    # here, we do W0x + (alpha / r) * BAx instead of just W0x, as the lora paper suggests
+    base_proj = linear_layer(x)
+    lora_proj = B_layer(A_layer(x))
+    scaling = (self.lora_alpha / self.lora_r)
+    proj = base_proj + scaling * lora_proj
     # Next, we need to produce multiple heads for the proj. This is done by spliting the
     # hidden state to self.num_attention_heads, each of size self.attention_head_size.
     proj = rearrange(proj, 'b t (h d) -> b t h d', h=self.num_attention_heads)
@@ -68,8 +94,15 @@ class CausalSelfAttention(nn.Module):
     # using self.transform (more details inside the function).
     # Size of *_layer is [bs, num_attention_heads, seq_len, attention_head_size].
     key_layer = self.transform(hidden_states, self.key)
-    value_layer = self.transform(hidden_states, self.value)
-    query_layer = self.transform(hidden_states, self.query)
+    if self.use_lora:
+        # lora paper only adapts Wq and Wv... doing just that for now
+        query_layer = self.transform_lora(hidden_states, self.query,
+                                    self.query_lora_A, self.query_lora_B)
+        value_layer = self.transform_lora(hidden_states, self.value,
+                                    self.value_lora_A, self.value_lora_B)
+    else:
+        query_layer = self.transform(hidden_states, self.query)
+        value_layer = self.transform(hidden_states, self.value)
     
     # Calculate the multi-head attention.
     attn_value = self.attention(key_layer, query_layer, value_layer, attention_mask)
